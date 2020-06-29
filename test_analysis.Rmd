@@ -1,0 +1,289 @@
+---
+name: metrics_test_analysis
+owner: vmandela99@gmail.com
+metrics:
+  avg_trp:
+    title: payment consistency
+    description: How well clients pay their loans
+  nb_product:
+    title: Type of product
+    description: The type of product being sold
+  nb_total_amount:
+    title: Total amount paid
+    description: Not adjusted for principal
+  nb_cycle:
+    title: Number of products
+    description: Product series an individual has purchased
+  nb_installments:
+    title: Installment
+    description: Number of installment periods
+  avg_loan_principal:
+    title: Mean principal amount (usd)
+    description: The principal amount paid.
+  avg_down_payment:
+    title: Avg_downpayment
+    description: Dinamic depending on the place
+dimensions:
+  product:
+    title: The product name
+    description: type of products being sold
+  branch:
+    title: County Name
+    description: Operational counties that this product is sold
+  status:
+    title: Status of account
+    description: Whether active or otherwise
+---
+
+## Description of the data
+
+The table shows the sales made between Jan 2019 and March 2020
+
+Each line is a sale (Account) with a product (e.g. LPG3) and a loan associated with the product (Total amount = Downpayment + Loan Principal)
+
+Cycle indicates how many products the client has bought, 1 means this sale is the first one, 3 means is the third purchase for same client
+
+TRP is a measure of how well the client is paying the loan, see below for definition
+
+
+Each client belongs to a Group of at least five members
+
+Each loan is a payment plan with a certain number of Instalments which are paid monthly
+
+Each loan has a start date (Disbursed Date) and date of when it was fully paid (Final Payment Date), hence theoretical end date is Disbursed Date + N monthly Instalments
+
+
+```{r Packages, include=FALSE}
+library(tidyverse)                        #for manipulation
+library(readxl)                           #for reading xlsx data
+library(janitor)                          #for cleaning data
+
+theme_set(theme_light())                  #friendly theme (easier to read)
+```
+
+# Explore
+
+```{r pre-processing, include=FALSE}
+sales <- readxl::read_xlsx("Book1.xlsx")    #get the data
+
+filtered_sales <- sales %>% 
+  janitor::clean_names() %>% 
+  mutate_if(is.character, factor) %>% 
+  mutate_at(vars(account), factor) %>% 
+  select(-client_name) %>% 
+    filter(!is.na(account))
+  
+skimr::skim(filtered_sales)
+```
+
+# impute the data
+
+```{r}
+library(naniar)
+
+#look the amount of missing-ness
+filtered_sales %>% 
+  select(-c(client_id, dob, id_card, account, disbursed_date, group_id, final_payment_date)) %>% 
+  gg_miss_upset()
+```
+
+```{r}
+#library(recipes)
+
+# imputed_df <- recipe( ~ cycle + trp, data = filtered_sales) %>% 
+#   step_knnimpute(all_predictors()) %>% 
+#   prep() %>% 
+#   juice() %>% 
+#   mutate(cycle = round(cycle))
+# imputed_df %>% 
+#   round(cycle)
+
+```
+
+# variable importance
+
+Can you infer from this data in which order clients that bought more than one product make their purchases? Do they first buy an LPG and then a stove or a solar lamp?
+
+# model
+
+```{r}
+library(lubridate)
+
+sales_df <- 
+  filtered_sales %>%
+  transmute(
+    more_than_one = case_when(cycle >= 2 ~ "Yes",
+                              TRUE ~ "No"),
+         age = year(Sys.Date()) - year(dob),
+    #product = fct_lump(product, 8),
+    gender, account, branch, product, loan_principal,
+    status, trp) %>%  
+  mutate_if(is.character, factor) %>% 
+  na.omit() %>% 
+  mutate_at(vars(account), as.integer)
+
+skimr::skim(sales_df)
+```
+
+
+```{r}
+library(tidymodels)
+
+set.seed(123)
+
+#workflow
+sales_split <- initial_split(sales_df, strata = more_than_one)
+
+sales_train <- training(sales_split)
+sales_test <- testing(sales_split)
+
+sales_rec <- recipe(more_than_one ~ .,
+                    data = sales_df) %>% 
+  update_role(account, new_role = "id") %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+sales_rec
+
+sales_prep <- prep(sales_rec)
+juiced <- juice(sales_prep)
+
+```
+
+```{r}
+rf_spec <- rand_forest(trees = 1000) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+
+sales_wf <- workflow() %>%
+  add_recipe(sales_rec) %>%
+  add_model(rf_spec)
+
+sales_wf
+```
+
+```{r}
+library(vip)
+library(ranger)
+
+varible_importance <- rf_spec %>%
+  set_engine("ranger", importance = "permutation") %>%
+  fit(more_than_one ~ .,
+    data = juice(sales_prep) %>% select(-account))%>% 
+      vip(geom = "point")
+
+
+```
+
+
+
+# Correlation
+
+
+any correlation/pattern between age of client and choice of product bought?
+repayment behaviour measured with TRP and choice of product bought?
+
+any correlation/pattern between gender and choice of product bought?
+
+```{r}
+
+library(corrr)
+
+cor_matrix <- sales_df %>% 
+  #select(:has_bank_account) %>% 
+  mutate_at(vars(more_than_one, gender, branch, product, status), as.integer) %>% 
+  correlate() %>%
+  rearrange() %>%
+  shave() 
+
+cor_matrix %>% 
+  knitr::kable()
+
+cor_matrix %>%
+  rplot(shape = 15, colours = c("darkorange", "white", "darkcyan")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+#Trend in payment of loans
+
+how long do clients really take to fully pay their loans, what is the distribution? Any difference between products?
+
+
+```{r}
+filtered_sales %>% 
+  filter(!is.na(final_payment_date)) %>% 
+  mutate(days_to_fully_pay = day(final_payment_date) - day(disbursed_date)) %>% ggplot(aes(days_to_fully_pay, fill = product)) + 
+  geom_density(alpha = 0.5) 
+  
+```
+
+```{r}
+
+library(tidymetrics)      #load the package
+
+sales_summarized <- filtered_sales %>% 
+  filter(product %in% c("LPG3", "LPG2", "CNVS", "P400",
+                     "JIKO", "BORA",
+                     "SKH"),
+         !is.na(final_payment_date)) %>%
+  rename(date = final_payment_date) %>%
+  mutate(date = as.Date(date)) %>% 
+  cross_by_dimensions(product, branch, status) %>%
+  cross_by_periods(c("day", "week", "month", "year"),
+                   windows = 28) %>%
+  summarize(avg_trp = mean(trp, na.rm = T), 
+            nb_product = n_distinct(product),
+            nb_total_amount = sum(total_amount),
+            nb_cycle = sum(cycle),
+            nb_installments = sum(installments),
+            avg_loan_principal = mean(loan_principal),
+            avg_down_payment = mean(down_payment)
+            ) %>%    #theatre
+  ungroup()
+
+```
+
+```{r}
+use_metrics_scaffold(sales_summarized)       #get the metrics details
+sales_metrics <- create_metrics(sales_summarized)
+sales_metrics
+
+saveRDS(sales_metrics, "sales_metrics.rds")
+```
+
+```{r}
+library(shinymetrics)
+
+preview_metric(sales_metrics$test_analysis_avg_trp)
+preview_metric(sales_metrics$test_analysis_nb_product)
+preview_metric(sales_metrics$test_analysis_nb_total_amount)
+preview_metric(sales_metrics$test_analysis_nb_cycle)
+preview_metric(sales_metrics$test_analysis_nb_installments)
+preview_metric(sales_metrics$test_analysis_avg_loan_principal)
+preview_metric(sales_metrics$test_analysis_avg_down_payment)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
